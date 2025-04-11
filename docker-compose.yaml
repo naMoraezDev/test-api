@@ -1,0 +1,9 @@
+services:
+  api:
+    image: 471281676991.dkr.ecr.us-east-1.amazonaws.com/lance-auth-api:${DD_VERSION}-${DD_ENV}
+    build: .
+    restart: always
+    env_file:
+      - ./.env
+    ports:
+      - 3017:3017

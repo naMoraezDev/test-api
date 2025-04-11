@@ -1,0 +1,16 @@
+version: 0.0
+os: linux
+
+files:
+  - source: ./
+    destination: /var/www/auth-api-dev.lancecorp.com.br
+
+permissions:
+  - object: /var/www/auth-api-dev.lancecorp.com.br
+    owner: ubuntu
+    group: ubuntu
+
+hooks:
+  ApplicationStart:
+    - location: deploy/scripts/start.sh
+      runas: ubuntu

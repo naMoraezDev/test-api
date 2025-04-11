@@ -1,0 +1,44 @@
+image: atlassian/default-image:2
+
+pipelines:
+  branches:
+    dev:
+      - step:
+          name: Build
+          script:
+            - pwd
+            - ll
+            - cp .env.dev .env
+            - zip -x '.git/*' -r build.zip * .[^.]*
+          artifacts:
+            - build.zip
+
+      - step:
+          name: Upload to S3 Bucket
+          services:
+            - docker
+          script:
+            - pipe: atlassian/aws-code-deploy:1.2.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                COMMAND: upload
+                APPLICATION_NAME: lance-auth-api-dev
+                ZIP_FILE: build.zip
+
+      - step:
+          name: Deploy with CodeDeploy
+          services:
+            - docker
+          script:
+            - pipe: atlassian/aws-code-deploy:1.5.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                COMMAND: deploy
+                APPLICATION_NAME: lance-auth-api-dev
+                DEPLOYMENT_GROUP: lance-auth-api-dev-group
+                FILE_EXISTS_BEHAVIOR: OVERWRITE
+                IGNORE_APPLICATION_STOP_FAILURES: 'true'

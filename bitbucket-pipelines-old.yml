@@ -1,0 +1,230 @@
+image: atlassian/default-image:4
+
+setup-env: &setup-env
+  name: Setup env
+  script:
+    - pwd
+    - ls -las
+
+    - mkdir -p .cicd
+
+    - export SERVICE_VERSION="${VERSION}-${BITBUCKET_BUILD_NUMBER}"
+    - export IMAGE_HOST="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/"
+    - export IMAGE_NAME="lance-${DEPLOY_NAME}"
+    - export IMAGE_TAG="${SERVICE_VERSION}-${SERVICE_ENV}"
+
+    - envsubst < cicd/.env.deployment > .cicd/.env
+    - echo $'\n\n' >> .cicd/.env
+    - envsubst < cicd/.env.pipeline >> .cicd/.env
+
+    - envsubst < .env.example > .env
+    - echo "//registry.npmjs.org/:_authToken=$NPM_AUTH_TOKEN" > .npmrc
+
+    - ls -las . .cicd
+  artifacts:
+    - .cicd/.env
+    - .env
+    - .npmrc
+
+base-version-tag: &base-version-tag
+  name: Base Version Tag
+  script:
+    - echo "base version ${VERSION}"
+    - git tag -a -m "Tagging for release ${VERSION}" "${VERSION}"
+    - git push origin ${VERSION}
+
+version-tag: &version-tag
+  name: Version Tag
+  script:
+    - export SERVICE_VERSION="${VERSION}-${BITBUCKET_BUILD_NUMBER}"
+    - echo "version ${SERVICE_VERSION}"
+    - git tag -a -m "Tagging for release ${SERVICE_VERSION}" "${SERVICE_VERSION}"
+    - git push origin ${SERVICE_VERSION}
+
+eks-vars: &eks-vars
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+  AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+  CLUSTER_NAME: ${EKS_CLUSTER_NAME}
+  KUBECTL_ARGS:
+    - -n
+    - ${K8S_NAMESPACE}
+  DEBUG: 'true'
+
+cd-setup: &cd-setup
+  name: CodeDeploy - Setup and build files
+  script:
+    - set -a
+    - source .cicd/.env
+    - set +a
+
+    - envsubst < cicd/codedeploy/appspec.yml > appspec.yml
+
+    - ls -las . .cicd
+
+    - zip -x '.git/*' -x '.cicd/*' -r build.zip * .[^.]*
+  artifacts:
+    - appspec.yml
+    - build.zip
+
+cd-s3: &cd-s3
+  name: CodeDeploy - Upload to S3 bucket
+  services:
+    - docker
+  script:
+    - set -a
+    - source .cicd/.env
+    - set +a
+
+    - pipe: atlassian/aws-code-deploy:1.4.0
+      variables:
+        AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+        AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+        AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+        COMMAND: upload
+        APPLICATION_NAME: lance-${DEPLOY_NAME}-${SERVICE_ENV}
+        ZIP_FILE: build.zip
+
+cd-deploy: &cd-deploy
+  name: CodeDeploy - Deploy
+  services:
+    - docker
+  script:
+    - set -a
+    - source .cicd/.env
+    - set +a
+
+    - pipe: atlassian/aws-code-deploy:1.4.0
+      variables:
+        AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+        AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+        AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+        COMMAND: deploy
+        APPLICATION_NAME: lance-${DEPLOY_NAME}-${SERVICE_ENV}
+        DEPLOYMENT_GROUP: lance-${DEPLOY_NAME}-${SERVICE_ENV}-group
+        FILE_EXISTS_BEHAVIOR: OVERWRITE
+        IGNORE_APPLICATION_STOP_FAILURES: 'true'
+
+k8s-build: &k8s-build
+  name: Build and push to ECR
+  services:
+    - docker
+  script:
+    - set -a
+    - source .cicd/.env
+    - envsubst < .env.prod > .env
+    - source .env
+    - set +a
+
+    - ls -las . .cicd
+
+    - export DOCKER_BUILDKIT=1
+    - docker version
+    - docker info
+
+    - docker images
+    - docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
+    - docker images
+
+    - pipe: atlassian/aws-ecr-push-image:2.2.0
+      variables:
+        AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+        AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+        AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+        IMAGE_NAME: ${IMAGE_NAME}
+        TAGS: '${IMAGE_TAG}'
+
+k8s-manifests: &k8s-manifests
+  name: Generate kubernetes manifests files
+  script:
+    - set -a
+    - source .cicd/.env
+    - envsubst < .env.prod > .env
+    - source .env
+    - set +a
+
+    - mkdir -p .cicd/k8s
+
+    - export DEPLOYMENT_NAME="-$(sed 's/\./-/g' <<< $SERVICE_VERSION)"
+    - "export DEPLOYMENT_VERSION=$'\\n'\"      version: '${SERVICE_VERSION}'\""
+
+    - DEPLOYMENT_NAME='' DEPLOYMENT_REPLICAS=0 DEPLOYMENT_VERSION='' envsubst < cicd/k8s/deployment.yaml > .cicd/k8s/deployment.yaml
+    - envsubst < cicd/k8s/deployment.yaml > .cicd/k8s/deployment-version.yaml
+    - envsubst < cicd/k8s/service.yaml > .cicd/k8s/service.yaml
+    - envsubst < cicd/k8s/ingress.yaml > .cicd/k8s/ingress.yaml
+
+    - ls -las . .cicd .cicd/k8s
+  artifacts:
+    - .cicd/k8s/**
+
+k8s-deploy: &k8s-deploy
+  name: Deploy deployment to kubernetes EKS
+  script:
+    - ls -las . .cicd .cicd/k8s
+
+    - pipe: atlassian/aws-eks-kubectl-run:2.5.1
+      variables:
+        <<: *eks-vars
+        KUBECTL_COMMAND: apply -f .cicd/k8s/deployment.yaml
+    - pipe: atlassian/aws-eks-kubectl-run:2.5.1
+      variables:
+        <<: *eks-vars
+        KUBECTL_COMMAND: rollout status -f .cicd/k8s/deployment.yaml
+
+    - pipe: atlassian/aws-eks-kubectl-run:2.5.1
+      variables:
+        <<: *eks-vars
+        KUBECTL_COMMAND: apply -f .cicd/k8s/deployment-version.yaml
+    - pipe: atlassian/aws-eks-kubectl-run:2.5.1
+      variables:
+        <<: *eks-vars
+        KUBECTL_COMMAND: rollout status -f .cicd/k8s/deployment-version.yaml
+
+k8s-service: &k8s-service
+  name: Deploy service to kubernetes EKS
+  trigger: manual
+  script:
+    - pipe: atlassian/aws-eks-kubectl-run:2.5.1
+      variables:
+        <<: *eks-vars
+        KUBECTL_COMMAND: apply -f .cicd/k8s/service.yaml
+
+k8s-ingress: &k8s-ingress
+  name: Deploy ingress to kubernetes EKS
+  script:
+    - pipe: atlassian/aws-eks-kubectl-run:2.5.1
+      variables:
+        <<: *eks-vars
+        KUBECTL_COMMAND: apply -f .cicd/k8s/ingress.yaml
+
+pipelines:
+  branches:
+    develop:
+      - step:
+          <<: *setup-env
+          deployment: development
+      - step:
+          <<: *cd-setup
+      - step:
+          <<: *cd-s3
+      - step:
+          <<: *cd-deploy
+
+    main:
+      - step:
+          <<: *base-version-tag
+      - step:
+          <<: *setup-env
+          deployment: production
+      - step:
+          <<: *k8s-build
+      - step:
+          <<: *k8s-manifests
+      - step:
+          <<: *k8s-deploy
+      - step:
+          <<: *k8s-service
+      - step:
+          <<: *k8s-ingress
+      - step:
+          <<: *version-tag
